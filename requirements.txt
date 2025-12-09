@@ -1,4 +1,6 @@
 streamlit
 pandas
-pdfplumber
+pdf2image
+pytesseract
+pillow
 # Add any other required libraries (e.g., cffi, etc.)
