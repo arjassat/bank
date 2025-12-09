@@ -25,24 +25,24 @@ def clean_value(value):
     value = re.sub(r'[R$]', '', value, flags=re.IGNORECASE)
     value = re.sub(r'(\d)\s+(\d)', r'\1\2', value)
     # 2. Handle South African formatting (1 000,00 or 1.000,00)
-    if ',' in value:
-        value = value.replace('.', '').replace(' ', '')
-    else: # Handle standard dot-as-decimal format if no comma is present
-        value = value.replace(' ', '')
-    # 3. Replace the South African decimal comma with a standard dot
-    value = value.replace(',', '.')
+    if ',' in value and '.' in value:
+        # Assume dot thousand, comma decimal
+        value = value.replace('.', '').replace(',', '.')
+    elif ',' in value:
+        value = value.replace(',', '.')
+    value = value.replace(' ', '')
     
     # 4. Clean up formatting indicators (Dr/Cr)
     # NOTE: This ensures that if the AI missed the sign, the 'Dr' prefix/suffix is converted to a minus sign.
-    value = value.replace('Cr', '').replace('Dr', '-').strip()
-    
-    # 5. Final aggressive cleanup to remove non-numeric/non-dot/non-sign characters
-    value = re.sub(r'[^\d\.\-]+', '', value)
+    if 'dr' in value.lower():
+        value = '-' + re.sub(r'[^\d\.]', '', value)
+    elif 'cr' in value.lower():
+        value = re.sub(r'[^\d\.]', '', value)
+    else:
+        value = re.sub(r'[^\d\.\-]+', '', value)
     
     try:
-        if re.match(r'^-?\d*\.?\d+$', value):
-            return float(value)
-        return None
+        return float(value)
     except:
         return None
 
@@ -90,8 +90,6 @@ def extract_from_pdf(pdf_file_path: BytesIO, file_name: str) -> tuple[pd.DataFra
         statement_year = match.group(1) if match else None
         
         # Parse transactions from text
-        # Assume transaction lines follow a pattern like: Date (dd Mon) Description ... Debit/Credit Amount
-        # We will split lines and parse those matching date pattern
         lines = full_text.splitlines()
         transactions = []
         in_table = False
@@ -100,26 +98,34 @@ def extract_from_pdf(pdf_file_path: BytesIO, file_name: str) -> tuple[pd.DataFra
             if not line:
                 continue
             # Detect table header to start parsing
-            if re.search(r'Date.*Description.*(Debit|Credit|Amount)', line, re.IGNORECASE):
+            if re.search(r'Date.*Description.*Amount.*Balance.*Accrued', line, re.IGNORECASE):
                 in_table = True
                 continue
             if in_table:
-                # Match lines starting with date like '01 Sep'
-                match = re.match(r'(\d{1,2}\s+[A-Za-z]{3})\s+(.*?)\s+(-?[\d.,]+(?:\s*(Dr|Cr))?)?$', line, re.IGNORECASE)
+                # Improved regex to capture date, desc, amount, balance, charges
+                match = re.match(r'(\d{1,2} \w{3})\s+(.*)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2} ?(?:Cr|Dr)?)\s+([\d.]+)$', line)
                 if match:
                     date = match.group(1)
                     desc = match.group(2).strip()
-                    amt_str = match.group(3)
-                    if amt_str:
-                        amt = clean_value(amt_str)
-                        # Enforce sign: if 'Dr' or in debit column (assuming), negative; 'Cr' positive
-                        if 'dr' in amt_str.lower():
-                            amt = -abs(amt) if amt > 0 else amt
-                        elif 'cr' in amt_str.lower():
-                            amt = abs(amt) if amt < 0 else amt
-                        transactions.append({'Date': date, 'Description': desc, 'Amount': amt})
+                    amt_str = match.group(3).replace(',', '')
+                    balance_str = match.group(4)
+                    charges = match.group(5)
+                    try:
+                        amt = float(amt_str)
+                    except ValueError:
+                        continue
+                    
+                    # Determine sign based on description keywords
+                    desc_lower = desc.lower()
+                    credit_keywords = ['from', 'credit', 'deposit', 'rtc', 'geo payment from', 'credit absa']
+                    if any(keyword in desc_lower for keyword in credit_keywords):
+                        amt = abs(amt)
+                    else:
+                        amt = -abs(amt)
+                    
+                    transactions.append({'Date': date, 'Description': desc, 'Amount': amt})
                 # If line doesn't match, perhaps end of table
-                elif re.search(r'total|balance|summary', line, re.IGNORECASE):
+                elif re.search(r'total|balance|summary|closing|turnover', line, re.IGNORECASE):
                     in_table = False
         
         if not transactions:
@@ -155,7 +161,7 @@ def parse_pdf_data(pdf_file_path, file_name):
         df_transactions['Description'] = df_transactions['Description'].astype(str)
         
         # Use clean_value to standardize the numbers and convert any lingering 'Dr' to '-'
-        df_transactions['Amount'] = df_transactions['Amount'].apply(lambda x: clean_value(x))
+        df_transactions['Amount'] = df_transactions['Amount'].apply(lambda x: clean_value(str(x)))
         df_transactions.dropna(subset=['Amount'], inplace=True)
         
         if not df_transactions.empty:
